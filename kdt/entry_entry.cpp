@@ -5,12 +5,16 @@
 
 #define IOCTL_REGISTER_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define DRIVER_TAG 'mndr'
+#define DUMP_DIRECTORY_CHARS 512
 
 typedef struct _DRIVER_LOAD_INFO {
     WCHAR FilePath[512];
+    WCHAR DumpDirectory[DUMP_DIRECTORY_CHARS];
 } DRIVER_LOAD_INFO, *PDRIVER_LOAD_INFO;
+static_assert(sizeof(DRIVER_LOAD_INFO) == 2048, "Keep the kernel IOCTL layout in sync with dt.exe.");
 
 typedef struct _QUEUE_ENTRY {
     LIST_ENTRY ListEntry;
@@ -20,12 +24,29 @@ typedef struct _QUEUE_ENTRY {
 typedef struct _WORK_ITEM_CONTEXT {
     PIO_WORKITEM WorkItem;
     UNICODE_STRING FilePath;
+    UNICODE_STRING DumpDirectory;
+    WCHAR DumpDirectoryBuffer[DUMP_DIRECTORY_CHARS];
 } WORK_ITEM_CONTEXT, *PWORK_ITEM_CONTEXT;
 
 PDEVICE_OBJECT g_DeviceObject = NULL;
 PKEVENT g_UserEvent = NULL;
 LIST_ENTRY g_QueueHead;
 KSPIN_LOCK g_QueueLock;
+KSPIN_LOCK g_DumpDirectoryLock;
+WCHAR g_DumpDirectory[DUMP_DIRECTORY_CHARS];
+USHORT g_DumpDirectoryLength = 0;
+
+VOID SnapshotDumpDirectory(PWCHAR destination, USHORT destinationBytes, PUSHORT lengthBytes) {
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_DumpDirectoryLock, &oldIrql);
+    USHORT bytesToCopy = destinationBytes < sizeof(g_DumpDirectory)
+        ? destinationBytes : sizeof(g_DumpDirectory);
+    RtlZeroMemory(destination, destinationBytes);
+    RtlCopyMemory(destination, g_DumpDirectory, bytesToCopy);
+    *lengthBytes = g_DumpDirectoryLength;
+    KeReleaseSpinLock(&g_DumpDirectoryLock, oldIrql);
+    UNREFERENCED_PARAMETER(destinationBytes);
+}
 
 VOID ClearQueue() {
     KIRQL oldIrql;
@@ -110,8 +131,6 @@ VOID FileCopyWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context) {
     if (Context == NULL) return;
 
     PWORK_ITEM_CONTEXT context = (PWORK_ITEM_CONTEXT)Context;
-    UNICODE_STRING destFolder = RTL_CONSTANT_STRING(L"\\??\\C:\\DriverDump\\");
-
     if (context->FilePath.Length == 0 || context->FilePath.Buffer == NULL) {
         IoFreeWorkItem(context->WorkItem);
         ExFreePoolWithTag(context, DRIVER_TAG);
@@ -139,12 +158,22 @@ VOID FileCopyWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context) {
 
     if (fileName.Length > 0) {
         UNICODE_STRING destPath;
-        destPath.MaximumLength = destFolder.Length + fileName.Length + sizeof(WCHAR);
+        UNICODE_STRING ntPrefix = RTL_CONSTANT_STRING(L"\\??\\");
+        ULONG destinationBytes = ntPrefix.Length + context->DumpDirectory.Length + fileName.Length + sizeof(WCHAR);
+        if (destinationBytes > MAXUSHORT) {
+            IoFreeWorkItem(context->WorkItem);
+            ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
+            ExFreePoolWithTag(context, DRIVER_TAG);
+            return;
+        }
+
+        destPath.MaximumLength = (USHORT)destinationBytes;
         destPath.Buffer = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, destPath.MaximumLength, DRIVER_TAG);
 
         if (destPath.Buffer != NULL) {
             destPath.Length = 0;
-            RtlCopyUnicodeString(&destPath, &destFolder);
+            RtlCopyUnicodeString(&destPath, &ntPrefix);
+            RtlAppendUnicodeStringToString(&destPath, &context->DumpDirectory);
             RtlAppendUnicodeStringToString(&destPath, &fileName);
             CopyFileInKernel(&context->FilePath, &destPath);
             ExFreePoolWithTag(destPath.Buffer, DRIVER_TAG);
@@ -163,9 +192,24 @@ void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
         return;
     }
 
+    WCHAR dumpDirectorySnapshot[DUMP_DIRECTORY_CHARS]{};
+    USHORT dumpDirectoryLength = 0;
+    SnapshotDumpDirectory(dumpDirectorySnapshot, sizeof(dumpDirectorySnapshot), &dumpDirectoryLength);
+
     auto context = (PWORK_ITEM_CONTEXT)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(WORK_ITEM_CONTEXT), DRIVER_TAG);
     if (context != NULL) {
+        RtlZeroMemory(context, sizeof(WORK_ITEM_CONTEXT));
         context->FilePath.Length = 0;
+        context->DumpDirectory.Buffer = context->DumpDirectoryBuffer;
+        context->DumpDirectory.MaximumLength = sizeof(context->DumpDirectoryBuffer);
+        RtlCopyMemory(context->DumpDirectoryBuffer, dumpDirectorySnapshot, sizeof(dumpDirectorySnapshot));
+        context->DumpDirectory.Length = dumpDirectoryLength;
+        if (path->Length > MAXUSHORT - sizeof(WCHAR)) {
+            ExFreePoolWithTag(context, DRIVER_TAG);
+            context = NULL;
+        }
+    }
+    if (context != NULL) {
         context->FilePath.MaximumLength = path->Length + sizeof(WCHAR);
         context->FilePath.Buffer = (PWCH)ExAllocatePool2(POOL_FLAG_NON_PAGED, context->FilePath.MaximumLength, DRIVER_TAG);
         if (context->FilePath.Buffer != NULL) {
@@ -187,6 +231,14 @@ void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
     auto qEntry = (PQUEUE_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(QUEUE_ENTRY), DRIVER_TAG);
     if (qEntry != NULL) {
         RtlZeroMemory(&qEntry->Info, sizeof(DRIVER_LOAD_INFO));
+
+        USHORT directoryLength = dumpDirectoryLength;
+        RtlCopyMemory(qEntry->Info.DumpDirectory, dumpDirectorySnapshot,
+            sizeof(qEntry->Info.DumpDirectory));
+        if (directoryLength > sizeof(qEntry->Info.DumpDirectory) - sizeof(WCHAR)) {
+            directoryLength = sizeof(qEntry->Info.DumpDirectory) - sizeof(WCHAR);
+        }
+        qEntry->Info.DumpDirectory[directoryLength / sizeof(WCHAR)] = UNICODE_NULL;
 
         USHORT copyLength = path->Length;
         if (copyLength > sizeof(qEntry->Info.FilePath) - sizeof(WCHAR)) {
@@ -256,6 +308,9 @@ NTSTATUS ioc(PDEVICE_OBJECT d, PIRP i) {
                     KeAcquireSpinLock(&g_QueueLock, &oldIrql);
                     oldEvent = g_UserEvent;
                     g_UserEvent = newEvent;
+                    if (!IsListEmpty(&g_QueueHead)) {
+                        KeSetEvent(g_UserEvent, IO_NO_INCREMENT, FALSE);
+                    }
                     KeReleaseSpinLock(&g_QueueLock, oldIrql);
 
                     if (oldEvent != NULL) {
@@ -311,6 +366,56 @@ NTSTATUS ioc(PDEVICE_OBJECT d, PIRP i) {
         }
         break;
     }
+    case IOCTL_SET_DUMP_DIRECTORY: {
+        if (i->AssociatedIrp.SystemBuffer == NULL ||
+            in < 4 * sizeof(WCHAR) ||
+            in > sizeof(g_DumpDirectory) ||
+            (in % sizeof(WCHAR)) != 0) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        auto inputDirectory = (PWCHAR)i->AssociatedIrp.SystemBuffer;
+        USHORT inputCharacters = (USHORT)(in / sizeof(WCHAR));
+        USHORT pathCharacters = inputCharacters - 1;
+        if (inputDirectory[pathCharacters] != UNICODE_NULL ||
+            pathCharacters < 3 ||
+            !(((inputDirectory[0] >= L'A' && inputDirectory[0] <= L'Z') ||
+               (inputDirectory[0] >= L'a' && inputDirectory[0] <= L'z'))) ||
+            inputDirectory[1] != L':' ||
+            inputDirectory[2] != L'\\' ||
+            inputDirectory[pathCharacters - 1] != L'\\') {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        BOOLEAN valid = TRUE;
+        for (USHORT index = 0; index < pathCharacters; ++index) {
+            if (inputDirectory[index] == UNICODE_NULL ||
+                inputDirectory[index] == L'/' ||
+                inputDirectory[index] == L'*' ||
+                inputDirectory[index] == L'?' ||
+                inputDirectory[index] == L'"' ||
+                (index != 1 && inputDirectory[index] == L':')) {
+                valid = FALSE;
+                break;
+            }
+        }
+        if (!valid) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        KIRQL oldIrql;
+        KeAcquireSpinLock(&g_DumpDirectoryLock, &oldIrql);
+        RtlZeroMemory(g_DumpDirectory, sizeof(g_DumpDirectory));
+        RtlCopyMemory(g_DumpDirectory, inputDirectory, in);
+        g_DumpDirectoryLength = (USHORT)(pathCharacters * sizeof(WCHAR));
+        KeReleaseSpinLock(&g_DumpDirectoryLock, oldIrql);
+        status = STATUS_SUCCESS;
+        information = 0;
+        break;
+    }
     default:
         break;
     }
@@ -360,6 +465,10 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drvobj, PUNICODE_STRING path)
 
     InitializeListHead(&g_QueueHead);
     KeInitializeSpinLock(&g_QueueLock);
+    KeInitializeSpinLock(&g_DumpDirectoryLock);
+    RtlZeroMemory(g_DumpDirectory, sizeof(g_DumpDirectory));
+    RtlCopyMemory(g_DumpDirectory, L"C:\\DriverDump\\", sizeof(L"C:\\DriverDump\\"));
+    g_DumpDirectoryLength = (USHORT)(sizeof(L"C:\\DriverDump\\") - sizeof(WCHAR));
 
     drvobj->DriverUnload = unl;
     drvobj->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;

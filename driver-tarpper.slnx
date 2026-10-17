@@ -9,4 +9,7 @@
   <Project Path="kdt/kdt.vcxproj">
     <Deploy />
   </Project>
+  <Project Path="sdfilter/sdfilter.vcxproj" Id="4E4A7DF0-5C1B-4F31-9F93-1226389E335B">
+    <Platform Project="x64" />
+  </Project>
 </Solution>

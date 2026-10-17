@@ -20,6 +20,11 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\sdfilter\filter_protocol.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
     <Manifest Include="dt.exe.manifest">
       <Filter>资源文件</Filter>
     </Manifest>

@@ -85,31 +85,29 @@
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions></Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions></Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions></Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions></Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <Inf Include="kdt.inf" />
-  </ItemGroup>
-  <ItemGroup>
-    <FilesToPackage Include="$(TargetPath)" />
-  </ItemGroup>
   <ItemGroup>
     <ClCompile Include="entry_entry.cpp" />
   </ItemGroup>
