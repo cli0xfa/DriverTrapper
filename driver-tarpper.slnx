@@ -1,0 +1,12 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="dt/dt.vcxproj" Id="d0bc51f1-74d0-4eae-a383-aeafc5a3bf5f">
+    <Platform Project="x64" />
+  </Project>
+  <Project Path="kdt/kdt.vcxproj">
+    <Deploy />
+  </Project>
+</Solution>

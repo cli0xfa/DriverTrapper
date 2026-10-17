@@ -1,0 +1,25 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# MSBuild / WDK outputs
+**/x64/
+**/ARM64/
+**/Debug/
+**/Release/
+*.pdb
+*.obj
+*.ilk
+*.iobj
+*.ipch
+*.tlog/
+*.log
+*.recipe
+*.sys
+*.cat
+*.cer
+*.exe
+
