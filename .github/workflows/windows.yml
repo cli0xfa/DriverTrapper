@@ -22,6 +22,20 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Install matching Windows SDK and WDK
+        shell: pwsh
+        run: |
+          $packages = @(
+            'Microsoft.WindowsSDK.10.0.28000',
+            'Microsoft.WindowsWDK.10.0.28000'
+          )
+          foreach ($package in $packages) {
+            winget install --id $package --exact --accept-package-agreements --accept-source-agreements --disable-interactivity --silent
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to install $package (exit code $LASTEXITCODE)."
+            }
+          }
+
       - name: Build solution
         shell: pwsh
         run: |
