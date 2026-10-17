@@ -157,9 +157,6 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="driver_resource.rc" />
-  </ItemGroup>
-  <ItemGroup>
     <ProjectReference Include="..\kdt\kdt.vcxproj">
       <Project>{5511C348-FEE0-6041-1DEB-EC09C3E1D266}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
@@ -168,11 +165,6 @@
   <ItemGroup>
     <Manifest Include="dt.exe.manifest" />
   </ItemGroup>
-  <ItemDefinitionGroup>
-    <ResourceCompile>
-      <PreprocessorDefinitions>DRIVER_RESOURCE_PATH=\&quot;$([System.String]::Copy('$(SolutionDir)').Replace('\', '/'))$(Platform)/$(Configuration)/kdt.sys\&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-    </ResourceCompile>
-  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

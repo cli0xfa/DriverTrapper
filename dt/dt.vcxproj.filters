@@ -24,9 +24,4 @@
       <Filter>资源文件</Filter>
     </Manifest>
   </ItemGroup>
-  <ItemGroup>
-    <ResourceCompile Include="driver_resource.rc">
-      <Filter>资源文件</Filter>
-    </ResourceCompile>
-  </ItemGroup>
 </Project>

@@ -1,6 +1,0 @@
-#include "driver_resource.h"
-
-// Embed the built kernel driver as RCDATA so dt.exe can extract it at runtime.
-// The resource compiler receives this path from dt.vcxproj for the active
-// platform/configuration; both projects write to the same output directory.
-IDR_KDT_DRIVER RCDATA DRIVER_RESOURCE_PATH

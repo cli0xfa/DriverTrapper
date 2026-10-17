@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <shlwapi.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -7,6 +6,7 @@
 #include <exception>
 #include <cstdlib>
 #include <stdlib.h>
+#include <filesystem>
 
 // Desktop C++/WinRT apps don't link the C++/WinRT runtime library,
 // so disable the DLL module lock to avoid linker errors for delegates.
@@ -25,10 +25,6 @@
 #include <propkey.h>      // PKEY_AppUserModel_ID
 #include <propvarutil.h>  // InitPropVariantFromString, PropVariantClear
 
-// Resource ID for the embedded driver
-#include "driver_resource.h"
-
-#pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "propsys.lib")
 
 using namespace winrt;
@@ -45,9 +41,8 @@ typedef struct _DRIVER_LOAD_INFO {
 // AppUserModelID — identifies this app to the Windows notification system.
 constexpr wchar_t AUMID[] = L"DriverTarpper.DriverMonitor";
 
-// Paths for the embedded driver extraction.
-const wchar_t* const DRIVER_DIR      = L"C:\\DriverDump";
-const wchar_t* const DRIVER_SYS_PATH = L"C:\\DriverDump\\kdt.sys";
+// Captured driver images are written here by kdt.sys.
+const wchar_t* const DRIVER_DIR = L"C:\\DriverDump";
 
 // Shutdown event signalled by the console control handler on Ctrl+C.
 static HANDLE g_hShutdownEvent = nullptr;
@@ -139,48 +134,41 @@ std::wstring FileNameFromPath(const std::wstring& path)
 }
 
 // ---------------------------------------------------------------------------
-// Embedded-driver extraction + service management
+// Sidecar-driver lookup + service management
 // ---------------------------------------------------------------------------
 
-/// Extract the embedded kdt.sys from this executable's resources to disk.
-static bool ExtractDriverTo(const std::wstring& destPath)
+/// Find kdt.sys next to this executable, independent of the process working directory.
+static std::wstring GetDriverPathBesideExecutable()
 {
-    HRSRC hRes = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_KDT_DRIVER), RT_RCDATA);
-    if (!hRes) {
-        std::wcerr << L"[-] Driver resource not found (IDR_KDT_DRIVER)." << std::endl;
-        return false;
+    std::vector<wchar_t> executablePath(MAX_PATH);
+    while (true) {
+        DWORD length = GetModuleFileNameW(nullptr, executablePath.data(),
+                                          static_cast<DWORD>(executablePath.size()));
+        if (length == 0) {
+            std::wcerr << L"[-] Cannot determine executable path (error "
+                       << GetLastError() << L")." << std::endl;
+            return L"";
+        }
+
+        if (length < executablePath.size()) {
+            std::filesystem::path executable(
+                std::wstring(executablePath.data(), length));
+            return (executable.parent_path() / L"kdt.sys").wstring();
+        }
+
+        constexpr size_t maxPathLength = 32768;
+        if (executablePath.size() >= maxPathLength) {
+            std::wcerr << L"[-] Executable path exceeds the supported length." << std::endl;
+            return L"";
+        }
+
+        size_t nextSize = executablePath.size() * 2;
+        if (nextSize > maxPathLength) nextSize = maxPathLength;
+        executablePath.resize(nextSize);
     }
-
-    HGLOBAL hLoaded = LoadResource(nullptr, hRes);
-    if (!hLoaded) return false;
-
-    void* pData = LockResource(hLoaded);
-    DWORD dataSize = SizeofResource(nullptr, hRes);
-
-    if (pData == nullptr || dataSize == 0) return false;
-
-    HANDLE hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, nullptr,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        std::wcerr << L"[-] Cannot write driver to " << destPath
-                    << L" (error " << GetLastError() << L")" << std::endl;
-        return false;
-    }
-
-    DWORD written = 0;
-    BOOL ok = WriteFile(hFile, pData, dataSize, &written, nullptr);
-    CloseHandle(hFile);
-
-    if (!ok || written != dataSize) {
-        DeleteFileW(destPath.c_str());
-        return false;
-    }
-    return true;
 }
 
-/// Before extracting the driver binary, stop + delete any stale "kdt" service
-/// from a previous (possibly crashed) run.  This forces the kernel to unload
-/// the old driver module and release the file lock on kdt.sys.
+/// Stop + delete any stale "kdt" service from a previous (possibly crashed) run.
 static void CleanupStaleDriverService()
 {
     SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
@@ -265,9 +253,6 @@ static void StopDriverService()
 
     CloseServiceHandle(g_hDriverService);
     g_hDriverService = nullptr;
-
-    // Clean up the extracted driver binary left on disk.
-    DeleteFileW(DRIVER_SYS_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,32 +391,33 @@ int main()
     g_hShutdownEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual-reset
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-    // ---------- stop stale driver & extract embedded driver ----------
+    // ---------- locate sidecar driver & stop stale service ----------
     CreateDirectoryW(DRIVER_DIR, nullptr);
 
-    // Stop + delete any stale service from a previous (crashed) run,
-    // so the kernel unloads the old driver and releases the file lock.
-    CleanupStaleDriverService();
-
-    std::wcout << L"[*] Extracting driver to " << DRIVER_SYS_PATH << L" ... ";
-    bool extracted = false;
-    for (int retry = 0; retry < 8; ++retry) {
-        if (ExtractDriverTo(DRIVER_SYS_PATH)) {
-            extracted = true;
-            break;
-        }
-        // The old driver may still be unloading — wait and retry.
-        Sleep(500);
-    }
-    if (!extracted) {
-        std::wcerr << L"FAILED" << std::endl;
+    std::wstring driverPath = GetDriverPathBesideExecutable();
+    if (driverPath.empty()) {
         return 1;
     }
-    std::wcout << L"OK (" << DRIVER_SYS_PATH << L")" << std::endl;
+
+    DWORD driverAttributes = GetFileAttributesW(driverPath.c_str());
+    if (driverAttributes == INVALID_FILE_ATTRIBUTES ||
+        (driverAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        std::wcerr << L"[-] Place kdt.sys beside dt.exe. Expected: "
+                   << driverPath;
+        if (driverAttributes == INVALID_FILE_ATTRIBUTES) {
+            std::wcerr << L" (error " << GetLastError() << L")";
+        }
+        std::wcerr << std::endl;
+        return 1;
+    }
+
+    // Stop + delete any stale service from a previous (crashed) run,
+    // so the kernel unloads the old driver before the new service starts.
+    CleanupStaleDriverService();
 
     // ---------- install & start driver service ----------
-    std::wcout << L"[*] Installing/starting driver service ... ";
-    if (!InstallAndStartDriver(DRIVER_SYS_PATH)) {
+    std::wcout << L"[*] Installing/starting driver from " << driverPath << L" ... ";
+    if (!InstallAndStartDriver(driverPath)) {
         std::wcerr << L"FAILED" << std::endl;
         return 1;
     }
