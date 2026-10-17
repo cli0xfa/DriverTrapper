@@ -35,6 +35,19 @@ KSPIN_LOCK g_QueueLock;
 KSPIN_LOCK g_DumpDirectoryLock;
 WCHAR g_DumpDirectory[DUMP_DIRECTORY_CHARS];
 USHORT g_DumpDirectoryLength = 0;
+EX_RUNDOWN_REF g_CopyWorkItemsRundown;
+volatile LONG g_Unloading = 0;
+
+VOID ReleaseCopyWorkItem(PWORK_ITEM_CONTEXT context) {
+    if (context->WorkItem != NULL) {
+        IoFreeWorkItem(context->WorkItem);
+    }
+    if (context->FilePath.Buffer != NULL) {
+        ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
+    }
+    ExFreePoolWithTag(context, DRIVER_TAG);
+    ExReleaseRundownProtection(&g_CopyWorkItemsRundown);
+}
 
 VOID SnapshotDumpDirectory(PWCHAR destination, USHORT destinationBytes, PUSHORT lengthBytes) {
     KIRQL oldIrql;
@@ -132,8 +145,7 @@ VOID FileCopyWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context) {
 
     PWORK_ITEM_CONTEXT context = (PWORK_ITEM_CONTEXT)Context;
     if (context->FilePath.Length == 0 || context->FilePath.Buffer == NULL) {
-        IoFreeWorkItem(context->WorkItem);
-        ExFreePoolWithTag(context, DRIVER_TAG);
+        ReleaseCopyWorkItem(context);
         return;
     }
 
@@ -161,9 +173,7 @@ VOID FileCopyWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context) {
         UNICODE_STRING ntPrefix = RTL_CONSTANT_STRING(L"\\??\\");
         ULONG destinationBytes = ntPrefix.Length + context->DumpDirectory.Length + fileName.Length + sizeof(WCHAR);
         if (destinationBytes > MAXUSHORT) {
-            IoFreeWorkItem(context->WorkItem);
-            ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
-            ExFreePoolWithTag(context, DRIVER_TAG);
+            ReleaseCopyWorkItem(context);
             return;
         }
 
@@ -180,15 +190,14 @@ VOID FileCopyWorkItemRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context) {
         }
     }
 
-    IoFreeWorkItem(context->WorkItem);
-    ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
-    ExFreePoolWithTag(context, DRIVER_TAG);
+    ReleaseCopyWorkItem(context);
 }
 
 void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
     UNREFERENCED_PARAMETER(im);
 
-    if (path == NULL || path->Buffer == NULL || path->Length == 0 || pid != 0) {
+    if (InterlockedCompareExchange(&g_Unloading, 0, 0) != 0 ||
+        path == NULL || path->Buffer == NULL || path->Length == 0 || pid != 0) {
         return;
     }
 
@@ -216,7 +225,14 @@ void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
             RtlCopyUnicodeString(&context->FilePath, path);
             context->WorkItem = IoAllocateWorkItem(g_DeviceObject);
             if (context->WorkItem != NULL) {
-                IoQueueWorkItem(context->WorkItem, FileCopyWorkItemRoutine, DelayedWorkQueue, context);
+                if (ExAcquireRundownProtection(&g_CopyWorkItemsRundown)) {
+                    IoQueueWorkItem(context->WorkItem, FileCopyWorkItemRoutine, DelayedWorkQueue, context);
+                }
+                else {
+                    IoFreeWorkItem(context->WorkItem);
+                    ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
+                    ExFreePoolWithTag(context, DRIVER_TAG);
+                }
             }
             else {
                 ExFreePoolWithTag(context->FilePath.Buffer, DRIVER_TAG);
@@ -257,7 +273,13 @@ void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
 }
 
 void unl(PDRIVER_OBJECT d) {
+    InterlockedExchange(&g_Unloading, 1);
     PsRemoveLoadImageNotifyRoutine(imcb);
+
+    // Image-notify callbacks can queue file-copy work that outlives the
+    // callback itself. Keep the driver image and device object alive until
+    // every queued routine has released its rundown reference.
+    ExWaitForRundownProtectionRelease(&g_CopyWorkItemsRundown);
 
     PKEVENT oldEvent = NULL;
     KIRQL oldIrql;
@@ -466,6 +488,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drvobj, PUNICODE_STRING path)
     InitializeListHead(&g_QueueHead);
     KeInitializeSpinLock(&g_QueueLock);
     KeInitializeSpinLock(&g_DumpDirectoryLock);
+    ExInitializeRundownProtection(&g_CopyWorkItemsRundown);
+    g_Unloading = 0;
     RtlZeroMemory(g_DumpDirectory, sizeof(g_DumpDirectory));
     RtlCopyMemory(g_DumpDirectory, L"C:\\DriverDump\\", sizeof(L"C:\\DriverDump\\"));
     g_DumpDirectoryLength = (USHORT)(sizeof(L"C:\\DriverDump\\") - sizeof(WCHAR));

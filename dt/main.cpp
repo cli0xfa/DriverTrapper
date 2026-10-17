@@ -42,7 +42,7 @@ using namespace Windows::Data::Xml::Dom;
 #define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-constexpr wchar_t AUMID[] = L"DriverTarpper.DriverMonitor";
+constexpr wchar_t AUMID[] = L"DriverTrapper.DriverMonitor";
 constexpr size_t DUMP_DIRECTORY_CHARS = 512;
 constexpr UINT WM_APP_STATUS = WM_APP + 1;
 constexpr UINT WM_APP_WORKER_STARTED = WM_APP + 2;
@@ -120,6 +120,9 @@ struct AppState {
     HWND statusLabel = nullptr;
     HWND filterStatusLabel = nullptr;
     HWND eventList = nullptr;
+    HFONT uiFont = nullptr;
+    UINT dpi = 96;
+    bool ownsUiFont = false;
     HANDLE stopEvent = nullptr;
     HANDLE configEvent = nullptr;
     HANDLE workerThread = nullptr;
@@ -142,6 +145,148 @@ struct AppState {
 static AppState g_app;
 static SC_HANDLE g_hDriverService = nullptr;
 static std::vector<ToastNotification> g_activeToasts;
+
+static UINT GetSystemDpiCompat()
+{
+    using GetDpiForSystemFn = UINT(WINAPI*)();
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto getDpiForSystem = reinterpret_cast<GetDpiForSystemFn>(
+        GetProcAddress(user32, "GetDpiForSystem"));
+    if (getDpiForSystem != nullptr) {
+        const UINT dpi = getDpiForSystem();
+        if (dpi != 0)
+            return dpi;
+    }
+
+    HDC screen = GetDC(nullptr);
+    const int dpi = screen != nullptr ? GetDeviceCaps(screen, LOGPIXELSY) : 96;
+    if (screen != nullptr)
+        ReleaseDC(nullptr, screen);
+    return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+
+static UINT GetWindowDpiCompat(HWND window)
+{
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+        GetProcAddress(user32, "GetDpiForWindow"));
+    if (getDpiForWindow != nullptr) {
+        const UINT dpi = getDpiForWindow(window);
+        if (dpi != 0)
+            return dpi;
+    }
+    return GetSystemDpiCompat();
+}
+
+static int ScaleForDpi(int value, UINT dpi)
+{
+    return MulDiv(value, static_cast<int>(dpi), 96);
+}
+
+static int Scale(int value)
+{
+    return ScaleForDpi(value, g_app.dpi != 0 ? g_app.dpi : 96);
+}
+
+static HFONT CreateSystemUiFont(UINT dpi)
+{
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+
+    using SystemParametersInfoForDpiFn = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto systemParametersInfoForDpi = reinterpret_cast<SystemParametersInfoForDpiFn>(
+        GetProcAddress(user32, "SystemParametersInfoForDpi"));
+
+    bool metricsAreForTargetDpi = false;
+    if (systemParametersInfoForDpi != nullptr) {
+        metricsAreForTargetDpi = systemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi) != FALSE;
+    }
+    if (!metricsAreForTargetDpi &&
+        !SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+        return nullptr;
+
+    if (!metricsAreForTargetDpi) {
+        const UINT systemDpi = GetSystemDpiCompat();
+        metrics.lfMessageFont.lfHeight = MulDiv(metrics.lfMessageFont.lfHeight,
+                                               static_cast<int>(dpi),
+                                               static_cast<int>(systemDpi));
+        metrics.lfMessageFont.lfWidth = MulDiv(metrics.lfMessageFont.lfWidth,
+                                               static_cast<int>(dpi),
+                                               static_cast<int>(systemDpi));
+    }
+    return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+static void ApplySystemUiFont(UINT dpi)
+{
+    HFONT newFont = CreateSystemUiFont(dpi);
+    bool ownsNewFont = newFont != nullptr;
+    if (newFont == nullptr)
+        newFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+    if (newFont == nullptr)
+        return;
+
+    g_app.dpi = dpi != 0 ? dpi : 96;
+    const HFONT oldFont = g_app.uiFont;
+    const bool ownsOldFont = g_app.ownsUiFont;
+    g_app.uiFont = newFont;
+    g_app.ownsUiFont = ownsNewFont;
+
+    for (HWND control : {g_app.directoryLabel, g_app.directoryEdit, g_app.browseButton, g_app.applyButton,
+                         g_app.startButton, g_app.stopButton, g_app.statusLabel, g_app.filterStatusLabel,
+                         g_app.eventList}) {
+        if (control != nullptr)
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
+    }
+    if (g_app.eventList != nullptr) {
+        HWND header = ListView_GetHeader(g_app.eventList);
+        if (header != nullptr)
+            SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(newFont), TRUE);
+    }
+
+    if (oldFont != nullptr && ownsOldFont)
+        DeleteObject(oldFont);
+}
+
+static void AdjustWindowRectForDpiCompat(RECT* rect, DWORD style, BOOL hasMenu,
+                                         DWORD exStyle, UINT dpi)
+{
+    using AdjustWindowRectExForDpiFn = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    auto adjustWindowRectExForDpi = reinterpret_cast<AdjustWindowRectExForDpiFn>(
+        GetProcAddress(user32, "AdjustWindowRectExForDpi"));
+    if (adjustWindowRectExForDpi != nullptr)
+        adjustWindowRectExForDpi(rect, style, hasMenu, exStyle, dpi);
+    else
+        AdjustWindowRectEx(rect, style, hasMenu, exStyle);
+}
+
+static void GetInitialWindowSize(UINT dpi, int& width, int& height)
+{
+    constexpr DWORD style = WS_OVERLAPPEDWINDOW;
+    RECT frame{};
+    AdjustWindowRectForDpiCompat(&frame, style, FALSE, 0, dpi);
+    const int frameWidth = frame.right - frame.left;
+    const int frameHeight = frame.bottom - frame.top;
+
+    RECT workArea{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0)) {
+        workArea.right = GetSystemMetrics(SM_CXSCREEN);
+        workArea.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    const int padding = ScaleForDpi(16, dpi);
+    const int workWidth = static_cast<int>(workArea.right - workArea.left);
+    const int workHeight = static_cast<int>(workArea.bottom - workArea.top);
+    const int maxClientWidth = std::max(1, workWidth - padding * 2 - frameWidth);
+    const int maxClientHeight = std::max(1, workHeight - padding * 2 - frameHeight);
+    const int clientWidth = std::min(ScaleForDpi(920, dpi), maxClientWidth);
+    const int clientHeight = std::min(ScaleForDpi(620, dpi), maxClientHeight);
+    width = clientWidth + frameWidth;
+    height = clientHeight + frameHeight;
+}
 
 static std::wstring FormatSystemError(DWORD error)
 {
@@ -201,7 +346,7 @@ static void UpdateControls()
     EnableWindow(g_app.stopButton, g_app.workerActive && !g_app.stopping);
 }
 
-static std::wstring GetSettingsFilePath()
+static std::wstring GetSettingsFilePath(const wchar_t* productFolder)
 {
     std::vector<wchar_t> localAppData(32768);
     DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData.data(),
@@ -210,23 +355,33 @@ static std::wstring GetSettingsFilePath()
         return L"";
 
     return (std::filesystem::path(std::wstring(localAppData.data(), length)) /
-            L"DriverTarpper" / L"settings.ini").wstring();
+            productFolder / L"settings.ini").wstring();
 }
 
 static std::wstring LoadInitialDirectory()
 {
-    g_app.settingsFile = GetSettingsFilePath();
+    g_app.settingsFile = GetSettingsFilePath(L"DriverTrapper");
     constexpr wchar_t defaultDirectory[] = L"C:\\DriverDump\\";
     if (g_app.settingsFile.empty())
         return defaultDirectory;
 
     wchar_t savedDirectory[DUMP_DIRECTORY_CHARS]{};
-    DWORD length = GetPrivateProfileStringW(L"Settings", L"DumpDirectory", defaultDirectory,
+    DWORD length = GetPrivateProfileStringW(L"Settings", L"DumpDirectory", L"",
                                             savedDirectory, static_cast<DWORD>(std::size(savedDirectory)),
                                             g_app.settingsFile.c_str());
-    if (length == 0 || length >= std::size(savedDirectory))
-        return defaultDirectory;
-    return savedDirectory;
+    if (length != 0 && length < std::size(savedDirectory))
+        return savedDirectory;
+
+    // Migrate users' saved directory from the previous, misspelled product folder.
+    const std::wstring legacySettingsFile = GetSettingsFilePath(L"DriverTarpper");
+    if (!legacySettingsFile.empty()) {
+        length = GetPrivateProfileStringW(L"Settings", L"DumpDirectory", L"",
+                                          savedDirectory, static_cast<DWORD>(std::size(savedDirectory)),
+                                          legacySettingsFile.c_str());
+        if (length != 0 && length < std::size(savedDirectory))
+            return savedDirectory;
+    }
+    return defaultDirectory;
 }
 
 static bool SaveDirectorySetting(const std::wstring& directory, std::wstring& error)
@@ -319,7 +474,7 @@ static bool NormalizeAndPrepareDirectory(const std::wstring& input,
     bool writable = false;
     DWORD writeError = ERROR_ACCESS_DENIED;
     for (unsigned attempt = 0; attempt < 8; ++attempt) {
-        std::wstring probePath = path + L".DriverTarpper-write-" + std::to_wstring(GetCurrentProcessId()) +
+        std::wstring probePath = path + L".DriverTrapper-write-" + std::to_wstring(GetCurrentProcessId()) +
                                  L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt);
         HANDLE probe = CreateFileW(probePath.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
                                    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
@@ -350,8 +505,8 @@ static bool EnsureAumidShortcut()
 
     std::wstring shortcutPath = std::wstring(startMenuPath) + L"\\检测到驱动加载.lnk";
     DWORD attributes = GetFileAttributesW(shortcutPath.c_str());
-    if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
-        return true;
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
 
     wchar_t executablePath[32768]{};
     DWORD executableLength = GetModuleFileNameW(nullptr, executablePath,
@@ -362,7 +517,7 @@ static bool EnsureAumidShortcut()
     try {
         auto shellLink = winrt::create_instance<IShellLinkW>(CLSID_ShellLink, CLSCTX_INPROC_SERVER);
         if (!shellLink || FAILED(shellLink->SetPath(executablePath)) ||
-            FAILED(shellLink->SetDescription(L"DriverTarpper -- Kernel driver load monitor")))
+            FAILED(shellLink->SetDescription(L"DriverTrapper — 驱动捕获器")))
             return false;
 
         auto propertyStore = shellLink.as<IPropertyStore>();
@@ -862,9 +1017,9 @@ static std::wstring StripServicePathQuotes(std::wstring path)
 static bool RegisterMinifilterService(const std::wstring& driverPath,
                                      MinifilterSession& session, std::wstring& error)
 {
-    constexpr wchar_t displayName[] = L"DriverTarpper self-delete evidence filter";
+    constexpr wchar_t displayName[] = L"DriverTrapper self-delete evidence filter";
     constexpr wchar_t loadOrderGroup[] = L"FSFilter Activity Monitor";
-    constexpr wchar_t instanceName[] = L"DriverTarpper Instance";
+    constexpr wchar_t instanceName[] = L"DriverTrapper Instance";
     constexpr wchar_t serviceRegistryPath[] = L"SYSTEM\\CurrentControlSet\\Services\\dtself\\Parameters";
     static constexpr wchar_t dependencies[] = L"FltMgr\0";
     const std::wstring serviceImagePath = driverPath.find_first_of(L" \t") == std::wstring::npos
@@ -1933,53 +2088,68 @@ static void LayoutControls(HWND window)
     GetClientRect(window, &client);
     const int width = client.right - client.left;
     const int height = client.bottom - client.top;
-    const int margin = 16;
+    const int margin = Scale(16);
+    const int editLeft = Scale(86);
+    const int applyWidth = Scale(96);
+    const int browseWidth = Scale(88);
+    const int buttonGap = Scale(8);
+    const int applyLeft = width - margin - applyWidth;
+    const int browseLeft = applyLeft - buttonGap - browseWidth;
 
-    MoveWindow(GetDlgItem(window, IDC_DIRECTORY_LABEL), margin, 17, 66, 24, TRUE);
-    MoveWindow(g_app.directoryEdit, 86, 14, std::max(120, width - 306), 28, TRUE);
-    MoveWindow(g_app.browseButton, width - 208, 14, 88, 28, TRUE);
-    MoveWindow(g_app.applyButton, width - 112, 14, 96, 28, TRUE);
-    MoveWindow(g_app.startButton, 86, 55, 92, 30, TRUE);
-    MoveWindow(g_app.stopButton, 188, 55, 92, 30, TRUE);
-    MoveWindow(g_app.statusLabel, 296, 58, std::max(100, width - 312), 24, TRUE);
-    MoveWindow(g_app.filterStatusLabel, margin, 88, std::max(100, width - margin * 2), 22, TRUE);
-    MoveWindow(g_app.eventList, margin, 117, std::max(100, width - margin * 2), std::max(80, height - 133), TRUE);
+    MoveWindow(g_app.directoryLabel, margin, Scale(17), Scale(66), Scale(24), TRUE);
+    MoveWindow(g_app.directoryEdit, editLeft, Scale(14),
+               std::max(Scale(120), browseLeft - Scale(4) - editLeft), Scale(28), TRUE);
+    MoveWindow(g_app.browseButton, browseLeft, Scale(14), browseWidth, Scale(28), TRUE);
+    MoveWindow(g_app.applyButton, applyLeft, Scale(14), applyWidth, Scale(28), TRUE);
+    MoveWindow(g_app.startButton, Scale(86), Scale(55), Scale(92), Scale(30), TRUE);
+    MoveWindow(g_app.stopButton, Scale(188), Scale(55), Scale(92), Scale(30), TRUE);
+    MoveWindow(g_app.statusLabel, Scale(296), Scale(58), std::max(Scale(100), width - Scale(312)), Scale(24), TRUE);
+    MoveWindow(g_app.filterStatusLabel, margin, Scale(88),
+               std::max(Scale(100), width - margin * 2), Scale(22), TRUE);
+    MoveWindow(g_app.eventList, margin, Scale(117), std::max(Scale(100), width - margin * 2),
+               std::max(Scale(80), height - Scale(133)), TRUE);
 
-    const int listWidth = std::max(100, width - margin * 2);
-    ListView_SetColumnWidth(g_app.eventList, 0, 145);
-    ListView_SetColumnWidth(g_app.eventList, 1, std::max(220, (listWidth - 425) / 2));
-    ListView_SetColumnWidth(g_app.eventList, 2, std::max(220, listWidth - 145 - std::max(220, (listWidth - 425) / 2) - 8));
+    const int listWidth = std::max(Scale(100), width - margin * 2);
+    const int timeWidth = Scale(145);
+    const int minimumPathWidth = Scale(220);
+    const int columnGap = Scale(8);
+    const int pathWidth = std::max(2, listWidth - timeWidth - columnGap);
+    const int sourceWidth = std::max(minimumPathWidth, pathWidth / 2);
+    const int targetWidth = std::max(minimumPathWidth, pathWidth - sourceWidth);
+    ListView_SetColumnWidth(g_app.eventList, 0, timeWidth);
+    ListView_SetColumnWidth(g_app.eventList, 1, sourceWidth);
+    ListView_SetColumnWidth(g_app.eventList, 2, targetWidth);
 }
 
 static bool CreateControls(HWND window)
 {
     const DWORD childStyle = WS_CHILD | WS_VISIBLE;
     g_app.directoryEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-        childStyle | WS_TABSTOP | ES_AUTOHSCROLL, 86, 14, 500, 28, window,
+        childStyle | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_DIRECTORY_EDIT), nullptr, nullptr);
     g_app.directoryLabel = CreateWindowExW(0, L"STATIC", L"转储目录：",
-        childStyle | SS_LEFT | SS_CENTERIMAGE, 16, 17, 66, 24, window,
+        childStyle | SS_LEFT | SS_CENTERIMAGE, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_DIRECTORY_LABEL), nullptr, nullptr);
     g_app.browseButton = CreateWindowExW(0, L"BUTTON", L"浏览…",
-        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 14, 88, 28, window,
+        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_BROWSE), nullptr, nullptr);
     g_app.applyButton = CreateWindowExW(0, L"BUTTON", L"应用",
-        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 14, 96, 28, window,
+        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_APPLY), nullptr, nullptr);
     g_app.startButton = CreateWindowExW(0, L"BUTTON", L"开始监控",
-        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 86, 55, 92, 30, window,
+        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_START), nullptr, nullptr);
     g_app.stopButton = CreateWindowExW(0, L"BUTTON", L"停止监控",
-        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 188, 55, 92, 30, window,
+        childStyle | WS_TABSTOP | BS_PUSHBUTTON, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_STOP), nullptr, nullptr);
     g_app.statusLabel = CreateWindowExW(0, L"STATIC", L"",
-        childStyle | SS_LEFT | SS_CENTERIMAGE, 296, 58, 500, 24, window,
+        childStyle | SS_LEFT | SS_CENTERIMAGE, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_STATUS), nullptr, nullptr);
     g_app.filterStatusLabel = CreateWindowExW(0, L"STATIC", L"自删除捕获尚未启动（按需）",
-        childStyle | SS_LEFT | SS_CENTERIMAGE, 16, 88, 860, 22, window,
+        childStyle | SS_LEFT | SS_CENTERIMAGE, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_FILTER_STATUS), nullptr, nullptr);
     g_app.eventList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        childStyle | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 16, 101, 860, 480, window,
+        childStyle | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, 0, 0, 0, 0, window,
         reinterpret_cast<HMENU>(IDC_EVENT_LIST), nullptr, nullptr);
 
     if (g_app.directoryLabel == nullptr || g_app.directoryEdit == nullptr || g_app.browseButton == nullptr || g_app.applyButton == nullptr ||
@@ -1988,11 +2158,7 @@ static bool CreateControls(HWND window)
         g_app.eventList == nullptr)
         return false;
 
-    HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-    for (HWND control : {g_app.directoryLabel, g_app.directoryEdit, g_app.browseButton, g_app.applyButton,
-                         g_app.startButton, g_app.stopButton, g_app.statusLabel, g_app.filterStatusLabel,
-                         g_app.eventList})
-        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    ApplySystemUiFont(g_app.dpi);
 
     ListView_SetExtendedListViewStyle(g_app.eventList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
     const wchar_t* columns[] = { L"时间", L"映像路径", L"预期转储路径" };
@@ -2039,6 +2205,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     switch (message) {
     case WM_CREATE:
         g_app.window = window;
+        g_app.dpi = GetWindowDpiCompat(window);
         if (!CreateControls(window))
             return -1;
         return 0;
@@ -2050,10 +2217,43 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
 
     case WM_GETMINMAXINFO: {
         auto limits = reinterpret_cast<MINMAXINFO*>(lParam);
-        limits->ptMinTrackSize.x = 720;
-        limits->ptMinTrackSize.y = 445;
+        const int padding = Scale(32);
+        RECT workArea{};
+        MONITORINFO monitorInfo{sizeof(monitorInfo)};
+        HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr && GetMonitorInfoW(monitor, &monitorInfo))
+            workArea = monitorInfo.rcWork;
+        else if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0)) {
+            workArea.right = GetSystemMetrics(SM_CXSCREEN);
+            workArea.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        const int workWidth = static_cast<int>(workArea.right - workArea.left);
+        const int workHeight = static_cast<int>(workArea.bottom - workArea.top);
+        const int availableWidth = std::max(Scale(320), workWidth - padding);
+        const int availableHeight = std::max(Scale(260), workHeight - padding);
+        limits->ptMinTrackSize.x = std::min(Scale(720), availableWidth);
+        limits->ptMinTrackSize.y = std::min(Scale(445), availableHeight);
         return 0;
     }
+
+    case WM_DPICHANGED: {
+        const UINT dpi = LOWORD(wParam) != 0 ? LOWORD(wParam) : 96;
+        ApplySystemUiFont(dpi);
+        const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+        if (suggested != nullptr) {
+            SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        LayoutControls(window);
+        return 0;
+    }
+
+    case WM_SETTINGCHANGE:
+        ApplySystemUiFont(g_app.dpi);
+        if (g_app.eventList != nullptr)
+            LayoutControls(window);
+        break;
 
     case WM_CTLCOLORSTATIC:
         if (reinterpret_cast<HWND>(lParam) == g_app.filterStatusLabel) {
@@ -2189,6 +2389,11 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
         return 0;
 
     case WM_DESTROY:
+        if (g_app.uiFont != nullptr && g_app.ownsUiFont) {
+            DeleteObject(g_app.uiFont);
+            g_app.uiFont = nullptr;
+            g_app.ownsUiFont = false;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -2244,7 +2449,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
     windowClass.lpfnWndProc = WindowProc;
-    windowClass.lpszClassName = L"DriverTarpperMainWindow";
+    windowClass.lpszClassName = L"DriverTrapperMainWindow";
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
@@ -2255,9 +2460,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         return 1;
     }
 
-    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"DriverTarpper - 驱动加载监控",
+    g_app.dpi = GetSystemDpiCompat();
+    int initialWidth = 920;
+    int initialHeight = 620;
+    GetInitialWindowSize(g_app.dpi, initialWidth, initialHeight);
+    HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"DriverTrapper - 驱动捕获器",
                                   WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                                  920, 620, nullptr, nullptr, instance, nullptr);
+                                  initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (window == nullptr) {
         DWORD error = GetLastError();
         DeleteCriticalSection(&g_app.commandLock);

@@ -946,6 +946,16 @@ NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS)
         FltCloseCommunicationPort(gServerPort);
         gServerPort = nullptr;
     }
+
+    // The filter manager does not unregister the minifilter on our behalf.
+    // Detach it from every volume and drain its callbacks before the image is
+    // unloaded; otherwise stale callback pointers can bugcheck the next I/O.
+    if (gFilter != nullptr) {
+        PFLT_FILTER filter = gFilter;
+        FltUnregisterFilter(filter);
+        gFilter = nullptr;
+    }
+
     if (InterlockedCompareExchange(&gAttachedInstances, 0, 0) == 0) {
         ClearCandidates();
         if (gSha256Provider != nullptr) {
