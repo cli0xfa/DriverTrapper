@@ -170,7 +170,7 @@
   </ItemGroup>
   <ItemDefinitionGroup>
     <ResourceCompile>
-      <PreprocessorDefinitions>DRIVER_RESOURCE_PATH=\&quot;$(SolutionDir)$(Platform)\$(Configuration)\kdt.sys\&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>DRIVER_RESOURCE_PATH=\&quot;$([System.String]::Copy('$(SolutionDir)').Replace('\', '/'))$(Platform)/$(Configuration)/kdt.sys\&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ResourceCompile>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
