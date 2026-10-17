@@ -6,10 +6,7 @@
   <Project Path="dt/dt.vcxproj" Id="d0bc51f1-74d0-4eae-a383-aeafc5a3bf5f">
     <Platform Project="x64" />
   </Project>
-  <Project Path="kdt/kdt.vcxproj">
-    <Deploy />
-  </Project>
-  <Project Path="sdfilter/sdfilter.vcxproj" Id="4E4A7DF0-5C1B-4F31-9F93-1226389E335B">
+  <Project Path="driver/dtcapture.vcxproj" Id="4E4A7DF0-5C1B-4F31-9F93-1226389E335B">
     <Platform Project="x64" />
   </Project>
 </Solution>

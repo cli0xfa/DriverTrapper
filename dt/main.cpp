@@ -30,7 +30,7 @@
 #include <utility>
 #include <vector>
 
-#include "..\\sdfilter\\filter_protocol.h"
+#include "..\\driver\\filter_protocol.h"
 
 #pragma comment(lib, "propsys.lib")
 
@@ -38,9 +38,9 @@ using namespace winrt;
 using namespace Windows::UI::Notifications;
 using namespace Windows::Data::Xml::Dom;
 
-#define IOCTL_REGISTER_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_REGISTER_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 constexpr wchar_t AUMID[] = L"DriverTrapper.DriverMonitor";
 constexpr size_t DUMP_DIRECTORY_CHARS = 512;
@@ -67,7 +67,7 @@ typedef struct _DRIVER_LOAD_INFO {
     WCHAR FilePath[512];
     WCHAR DumpDirectory[DUMP_DIRECTORY_CHARS];
 } DRIVER_LOAD_INFO, *PDRIVER_LOAD_INFO;
-static_assert(sizeof(DRIVER_LOAD_INFO) == 2048, "Keep the user-mode IOCTL layout in sync with kdt.sys.");
+static_assert(sizeof(DRIVER_LOAD_INFO) == 2048, "Keep the user-mode IOCTL layout in sync with dtcapture.sys.");
 
 struct UiEvent {
     std::wstring time;
@@ -143,7 +143,6 @@ struct AppState {
 };
 
 static AppState g_app;
-static SC_HANDLE g_hDriverService = nullptr;
 static std::vector<ToastNotification> g_activeToasts;
 
 static UINT GetSystemDpiCompat()
@@ -587,157 +586,7 @@ static std::wstring GetPathBesideExecutable(const wchar_t* fileName)
 
 static std::wstring GetDriverPathBesideExecutable()
 {
-    return GetPathBesideExecutable(L"kdt.sys");
-}
-
-static bool StopDriverService(std::wstring& error)
-{
-    if (g_hDriverService == nullptr)
-        return true;
-
-    SERVICE_STATUS serviceStatus{};
-    if (!ControlService(g_hDriverService, SERVICE_CONTROL_STOP, &serviceStatus)) {
-        DWORD stopError = GetLastError();
-        if (stopError != ERROR_SERVICE_NOT_ACTIVE && stopError != ERROR_SERVICE_MARKED_FOR_DELETE) {
-            error = MakeSystemError(L"停止 kdt 驱动失败", stopError);
-            CloseServiceHandle(g_hDriverService);
-            g_hDriverService = nullptr;
-            return false;
-        }
-    }
-
-    bool deleted = DeleteService(g_hDriverService) != FALSE;
-    DWORD deleteError = deleted ? ERROR_SUCCESS : GetLastError();
-    if (!deleted && deleteError != ERROR_SERVICE_MARKED_FOR_DELETE) {
-        error = MakeSystemError(L"删除 kdt 服务项失败", deleteError);
-        CloseServiceHandle(g_hDriverService);
-        g_hDriverService = nullptr;
-        return false;
-    }
-
-    CloseServiceHandle(g_hDriverService);
-    g_hDriverService = nullptr;
-    return true;
-}
-
-static bool IsOwnDriverService(SC_HANDLE service);
-
-static bool CleanupStaleDriverService(std::wstring& error)
-{
-    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-    if (manager == nullptr) {
-        error = MakeSystemError(L"打开服务管理器失败", GetLastError());
-        return false;
-    }
-
-    SC_HANDLE service = OpenServiceW(manager, L"kdt",
-                                     SERVICE_QUERY_CONFIG | SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
-    if (service == nullptr) {
-        DWORD openError = GetLastError();
-        CloseServiceHandle(manager);
-        if (openError == ERROR_SERVICE_DOES_NOT_EXIST)
-            return true;
-        error = MakeSystemError(L"检查旧 kdt 服务失败", openError);
-        return false;
-    }
-
-    if (!IsOwnDriverService(service)) {
-        error = L"检测到服务名为 kdt 的其他驱动服务，映像路径与本程序旁的 kdt.sys 不同；为避免影响其他程序，未停止或删除该服务。";
-        CloseServiceHandle(service);
-        CloseServiceHandle(manager);
-        return false;
-    }
-
-    SERVICE_STATUS status{};
-    if (!ControlService(service, SERVICE_CONTROL_STOP, &status)) {
-        DWORD stopError = GetLastError();
-        if (stopError != ERROR_SERVICE_NOT_ACTIVE && stopError != ERROR_SERVICE_MARKED_FOR_DELETE) {
-            error = MakeSystemError(L"停止旧 kdt 驱动失败", stopError);
-            CloseServiceHandle(service);
-            CloseServiceHandle(manager);
-            return false;
-        }
-    }
-
-    if (!DeleteService(service)) {
-        DWORD deleteError = GetLastError();
-        if (deleteError != ERROR_SERVICE_MARKED_FOR_DELETE) {
-            error = MakeSystemError(L"删除旧 kdt 服务项失败", deleteError);
-            CloseServiceHandle(service);
-            CloseServiceHandle(manager);
-            return false;
-        }
-    }
-
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
-    return true;
-}
-
-static bool InstallAndStartDriver(const std::wstring& binaryPath, std::wstring& error)
-{
-    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
-    if (manager == nullptr) {
-        error = MakeSystemError(L"打开服务管理器失败", GetLastError());
-        return false;
-    }
-
-    SC_HANDLE service = nullptr;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        service = CreateServiceW(manager, L"kdt", L"kdt Service", SERVICE_ALL_ACCESS,
-                                 SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
-                                 binaryPath.c_str(), nullptr, nullptr, nullptr, nullptr, nullptr);
-        if (service != nullptr)
-            break;
-
-        DWORD createError = GetLastError();
-        if (createError != ERROR_SERVICE_EXISTS) {
-            error = MakeSystemError(L"创建 kdt 驱动服务失败", createError);
-            CloseServiceHandle(manager);
-            return false;
-        }
-
-        SC_HANDLE oldService = OpenServiceW(manager, L"kdt",
-                                            SERVICE_QUERY_CONFIG | SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
-        if (oldService == nullptr) {
-            error = MakeSystemError(L"打开残留 kdt 服务失败", GetLastError());
-            CloseServiceHandle(manager);
-            return false;
-        }
-
-        if (!IsOwnDriverService(oldService)) {
-            error = L"服务名 kdt 已被其他驱动服务占用；为避免影响其他程序，未停止或删除该服务。";
-            CloseServiceHandle(oldService);
-            CloseServiceHandle(manager);
-            return false;
-        }
-
-        SERVICE_STATUS status{};
-        ControlService(oldService, SERVICE_CONTROL_STOP, &status);
-        DeleteService(oldService);
-        CloseServiceHandle(oldService);
-        Sleep(300);
-    }
-    CloseServiceHandle(manager);
-
-    if (service == nullptr) {
-        error = L"无法清理残留的 kdt 服务项。";
-        return false;
-    }
-
-    g_hDriverService = service;
-    if (!StartServiceW(service, 0, nullptr)) {
-        DWORD startError = GetLastError();
-        if (startError != ERROR_SERVICE_ALREADY_RUNNING) {
-            error = MakeSystemError(L"启动 kdt 驱动失败", startError);
-            std::wstring cleanupError;
-            StopDriverService(cleanupError);
-            if (!cleanupError.empty())
-                error += L"\r\n" + cleanupError;
-            return false;
-        }
-    }
-    return true;
+    return GetPathBesideExecutable(L"dtcapture.sys");
 }
 
 static std::wstring NtPathToDosPath(const std::wstring& ntPath)
@@ -1017,10 +866,10 @@ static std::wstring StripServicePathQuotes(std::wstring path)
 static bool RegisterMinifilterService(const std::wstring& driverPath,
                                      MinifilterSession& session, std::wstring& error)
 {
-    constexpr wchar_t displayName[] = L"DriverTrapper self-delete evidence filter";
+    constexpr wchar_t displayName[] = L"DriverTrapper unified capture driver";
     constexpr wchar_t loadOrderGroup[] = L"FSFilter Activity Monitor";
     constexpr wchar_t instanceName[] = L"DriverTrapper Instance";
-    constexpr wchar_t serviceRegistryPath[] = L"SYSTEM\\CurrentControlSet\\Services\\dtself\\Parameters";
+    constexpr wchar_t serviceRegistryPath[] = L"SYSTEM\\CurrentControlSet\\Services\\dtcapture\\Parameters";
     static constexpr wchar_t dependencies[] = L"FltMgr\0";
     const std::wstring serviceImagePath = driverPath.find_first_of(L" \t") == std::wstring::npos
         ? driverPath : L"\"" + driverPath + L"\"";
@@ -1062,14 +911,9 @@ static bool RegisterMinifilterService(const std::wstring& driverPath,
 
         std::wstring oldPath = StripServicePathQuotes(config->lpBinaryPathName != nullptr
             ? config->lpBinaryPathName : L"");
-        const size_t separator = oldPath.find_last_of(L"\\/");
-        const std::wstring oldFileName = separator == std::wstring::npos
-            ? oldPath : oldPath.substr(separator + 1);
-        const bool belongsToTool = _wcsicmp(oldFileName.c_str(), L"sdfilter.sys") == 0 ||
-            (config->lpDisplayName != nullptr &&
-             _wcsnicmp(config->lpDisplayName, displayName, std::size(displayName) - 1) == 0);
-        if (!belongsToTool) {
-            error = L"服务名 dtself 已被其他驱动占用；为避免改动其他服务，minifilter 未启动。";
+        const bool pathMatches = _wcsicmp(oldPath.c_str(), driverPath.c_str()) == 0;
+        if (!pathMatches) {
+            error = L"服务名 dtcapture 已被其他驱动占用；为避免改动其他服务，统一驱动未启动。";
             CloseServiceHandle(service);
             CloseServiceHandle(manager);
             return false;
@@ -1259,54 +1103,60 @@ static void CloseMinifilterSession(MinifilterSession& session, std::wstring& err
 }
 
 static bool StartMinifilterSession(const std::wstring& directory, HANDLE stopEvent,
-                                   MinifilterSession& session, std::wstring& error)
+                                   MinifilterSession& session, std::wstring& error,
+                                   bool loadDriver, bool serviceIsOwned)
 {
-    if (!CheckMinifilterAltitude(error))
-        return false;
+    if (loadDriver) {
+        if (!CheckMinifilterAltitude(error))
+            return false;
 
-    const std::wstring driverPath = GetPathBesideExecutable(L"sdfilter.sys");
-    DWORD attributes = driverPath.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(driverPath.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        error = L"请将 sdfilter.sys 放在 dt.exe 同一目录。";
-        if (driverPath.empty())
-            error += L"无法确定 dt.exe 所在目录。";
-        else
-            error += L"\r\n预期路径：" + driverPath;
-        return false;
-    }
+        const std::wstring driverPath = GetDriverPathBesideExecutable();
+        DWORD attributes = driverPath.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(driverPath.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            error = L"请将 dtcapture.sys 放在 dt.exe 同一目录。";
+            if (driverPath.empty())
+                error += L"无法确定 dt.exe 所在目录。";
+            else
+                error += L"\r\n预期路径：" + driverPath;
+            return false;
+        }
 
-    if (!RegisterMinifilterService(driverPath, session, error)) {
-        std::wstring cleanupError;
-        CloseMinifilterSession(session, cleanupError);
-        if (!cleanupError.empty()) error += L"\r\n" + cleanupError;
-        return false;
-    }
-    if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
-        error = L"启动已取消。";
-        CloseMinifilterSession(session, error);
-        return false;
-    }
+        if (!RegisterMinifilterService(driverPath, session, error)) {
+            std::wstring cleanupError;
+            CloseMinifilterSession(session, cleanupError);
+            if (!cleanupError.empty()) error += L"\r\n" + cleanupError;
+            return false;
+        }
+        if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
+            error = L"启动已取消。";
+            CloseMinifilterSession(session, error);
+            return false;
+        }
 
-    DWORD privilegeError = ERROR_SUCCESS;
-    DWORD restoreError = ERROR_SUCCESS;
-    HRESULT loadResult = LoadMinifilterWithPrivilege(privilegeError, restoreError);
-    const bool alreadyRunning = HRESULT_FACILITY(loadResult) == FACILITY_WIN32 &&
-        (HRESULT_CODE(loadResult) == ERROR_SERVICE_ALREADY_RUNNING ||
-         HRESULT_CODE(loadResult) == ERROR_ALREADY_EXISTS);
-    if (SUCCEEDED(loadResult) || alreadyRunning) {
-        session.unloadOnStop = true;
-        if (restoreError != ERROR_SUCCESS) {
-            error = MakeSystemError(L"恢复 SeLoadDriverPrivilege 状态失败", restoreError);
+        DWORD privilegeError = ERROR_SUCCESS;
+        DWORD restoreError = ERROR_SUCCESS;
+        HRESULT loadResult = LoadMinifilterWithPrivilege(privilegeError, restoreError);
+        const bool alreadyRunning = HRESULT_FACILITY(loadResult) == FACILITY_WIN32 &&
+            (HRESULT_CODE(loadResult) == ERROR_SERVICE_ALREADY_RUNNING ||
+             HRESULT_CODE(loadResult) == ERROR_ALREADY_EXISTS);
+        if (SUCCEEDED(loadResult) || alreadyRunning) {
+            session.unloadOnStop = true;
+            if (restoreError != ERROR_SUCCESS) {
+                error = MakeSystemError(L"恢复 SeLoadDriverPrivilege 状态失败", restoreError);
+                CloseMinifilterSession(session, error);
+                return false;
+            }
+        } else {
+            error = FormatFilterError(privilegeError == ERROR_SUCCESS
+                ? L"加载统一驱动失败" : L"启用 SeLoadDriverPrivilege 失败，无法加载统一驱动", loadResult);
+            if (restoreError != ERROR_SUCCESS)
+                error += L"\r\n" + MakeSystemError(L"恢复 SeLoadDriverPrivilege 状态失败", restoreError);
             CloseMinifilterSession(session, error);
             return false;
         }
     } else {
-        error = FormatFilterError(privilegeError == ERROR_SUCCESS
-            ? L"加载 minifilter 失败" : L"启用 SeLoadDriverPrivilege 失败，无法加载 minifilter", loadResult);
-        if (restoreError != ERROR_SUCCESS)
-            error += L"\r\n" + MakeSystemError(L"恢复 SeLoadDriverPrivilege 状态失败", restoreError);
-        CloseMinifilterSession(session, error);
-        return false;
+        session.unloadOnStop = serviceIsOwned;
+        session.serviceOwned = serviceIsOwned;
     }
 
     HRESULT connectResult = E_FAIL;
@@ -1328,9 +1178,6 @@ static bool StartMinifilterSession(const std::wstring& directory, HANDLE stopEve
         CloseMinifilterSession(session, error);
         return false;
     }
-    // dtself is this tool's dedicated service. Clean up an instance left by
-    // an earlier crash as well as one loaded by this process.
-    session.unloadOnStop = true;
     DT_FILTER_REPLY state{};
     bool attached = false;
     for (int attempt = 0; attempt < 20; ++attempt) {
@@ -1387,95 +1234,83 @@ enum class ExistingDriverState {
     Failed,
 };
 
-static bool IsOwnDriverService(SC_HANDLE service)
+static bool IsOwnCombinedDriverServiceRunning(bool& isOwnService, std::wstring& error)
 {
+    isOwnService = false;
     const std::wstring expectedPath = GetDriverPathBesideExecutable();
     if (expectedPath.empty())
+        return true;
+
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (manager == nullptr) {
+        error = MakeSystemError(L"检查统一驱动服务失败", GetLastError());
         return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(manager, DT_FILTER_SERVICE_NAME,
+        SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS);
+    if (service == nullptr) {
+        const DWORD openError = GetLastError();
+        CloseServiceHandle(manager);
+        if (openError == ERROR_SERVICE_DOES_NOT_EXIST)
+            return true;
+        error = MakeSystemError(L"读取统一驱动服务失败", openError);
+        return false;
+    }
+
+    SERVICE_STATUS status{};
+    if (!QueryServiceStatus(service, &status)) {
+        error = MakeSystemError(L"查询统一驱动服务状态失败", GetLastError());
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        return false;
+    }
+    if (status.dwCurrentState != SERVICE_RUNNING) {
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        return true;
+    }
 
     DWORD requiredBytes = 0;
     QueryServiceConfigW(service, nullptr, 0, &requiredBytes);
-    if (requiredBytes == 0)
+    if (requiredBytes == 0) {
+        error = MakeSystemError(L"读取统一驱动服务映像路径失败", GetLastError());
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
         return false;
+    }
 
     std::vector<BYTE> configBuffer(requiredBytes);
     auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(configBuffer.data());
     if (!QueryServiceConfigW(service, config, requiredBytes, &requiredBytes) ||
-        config->lpBinaryPathName == nullptr)
+        config->lpBinaryPathName == nullptr) {
+        error = MakeSystemError(L"查询统一驱动服务映像路径失败", GetLastError());
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
         return false;
+    }
 
-    return _wcsicmp(config->lpBinaryPathName, expectedPath.c_str()) == 0;
+    const std::wstring servicePath = StripServicePathQuotes(config->lpBinaryPathName);
+    isOwnService = _wcsicmp(servicePath.c_str(), expectedPath.c_str()) == 0;
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager);
+    return true;
 }
 
 static ExistingDriverState ProbeExistingDriver(HANDLE& device, std::wstring& error)
 {
     HANDLE deviceProbe = CreateFileW(L"\\\\.\\kdt", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    const DWORD deviceError = deviceProbe == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
-
-    // An openable device link is sufficient to reuse the driver. Only claim its
-    // service handle when it is the service this application installs; external
-    // services own their driver's lifetime and must not be stopped on exit.
     if (deviceProbe != INVALID_HANDLE_VALUE) {
         device = deviceProbe;
-
-        SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-        if (manager != nullptr) {
-            SC_HANDLE service = OpenServiceW(manager, L"kdt",
-                                              SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
-                                                  SERVICE_STOP | DELETE);
-            if (service != nullptr) {
-                SERVICE_STATUS status{};
-                if (QueryServiceStatus(service, &status) && status.dwCurrentState == SERVICE_RUNNING &&
-                    IsOwnDriverService(service)) {
-                    g_hDriverService = service;
-                    service = nullptr;
-                }
-                if (service != nullptr)
-                    CloseServiceHandle(service);
-            }
-            CloseServiceHandle(manager);
-        }
         return ExistingDriverState::Attached;
     }
 
-    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (manager == nullptr) {
-        error = MakeSystemError(L"检查 kdt 服务状态失败", GetLastError());
-        return ExistingDriverState::Failed;
-    }
-
-    SC_HANDLE service = OpenServiceW(manager, L"kdt", SERVICE_QUERY_STATUS | SERVICE_STOP | DELETE);
-    if (service == nullptr) {
-        const DWORD serviceError = GetLastError();
-        CloseServiceHandle(manager);
-        if (serviceError == ERROR_SERVICE_DOES_NOT_EXIST &&
-            (deviceError == ERROR_FILE_NOT_FOUND || deviceError == ERROR_PATH_NOT_FOUND))
-            return ExistingDriverState::NotLoaded;
-        if (serviceError == ERROR_SERVICE_DOES_NOT_EXIST) {
-            error = MakeSystemError(L"kdt 服务项不存在，但无法确认驱动设备状态", deviceError);
-            return ExistingDriverState::Failed;
-        }
-        error = MakeSystemError(L"打开 kdt 服务状态失败", serviceError);
-        return ExistingDriverState::Failed;
-    }
-
-    SERVICE_STATUS status{};
-    if (!QueryServiceStatus(service, &status)) {
-        const DWORD statusError = GetLastError();
-        CloseServiceHandle(service);
-        CloseServiceHandle(manager);
-        error = MakeSystemError(L"读取 kdt 服务状态失败", statusError);
-        return ExistingDriverState::Failed;
-    }
-
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager);
-    if (status.dwCurrentState == SERVICE_RUNNING) {
-        error = MakeSystemError(L"kdt 服务已运行，但无法打开驱动设备", deviceError);
-        return ExistingDriverState::Failed;
-    }
-    return ExistingDriverState::NotLoaded;
+    const DWORD deviceError = GetLastError();
+    if (deviceError == ERROR_FILE_NOT_FOUND || deviceError == ERROR_PATH_NOT_FOUND)
+        return ExistingDriverState::NotLoaded;
+    error = MakeSystemError(L"检查现有驱动设备失败", deviceError);
+    return ExistingDriverState::Failed;
 }
 
 static void PostDriverEvent(HWND window, const DRIVER_LOAD_INFO& info)
@@ -1589,76 +1424,77 @@ static unsigned __stdcall MonitorWorker(void* parameter)
         stopRequested = true;
 
     if (!failed && !stopRequested) {
-        PostStatus(window, L"正在注册并启动自删除捕获过滤器…");
-        std::wstring filterError;
-        if (StartMinifilterSession(args->directory, args->stopEvent, minifilter, filterError)) {
-            PostFilterStatus(window, true, L"自删除捕获可用：命中的内核映像文件会在破坏性操作前保存快照。");
-        } else if (WaitForSingleObject(args->stopEvent, 0) != WAIT_OBJECT_0) {
-            PostFilterStatus(window, false, L"自删除捕获不可用：" + filterError + L"；kdt 映像监控仍可运行。");
-        } else {
-            stopRequested = true;
-        }
-    }
-
-    if (!failed && !stopRequested) {
-        PostStatus(window, L"正在检查现有 kdt 驱动…");
+        PostStatus(window, L"正在检查现有驱动…");
         existingDriver = ProbeExistingDriver(device, error);
-        ownsDriverLifecycle = g_hDriverService != nullptr;
         if (existingDriver == ExistingDriverState::Failed)
             failed = true;
     }
 
     if (!failed && !stopRequested) {
+        std::wstring filterError;
         if (existingDriver == ExistingDriverState::Attached) {
-            PostStatus(window, ownsDriverLifecycle ? L"已复用本程序管理的 kdt 驱动…"
-                                                  : L"已复用由其他服务管理的 kdt 驱动…");
-        } else {
-            const std::wstring driverPath = GetDriverPathBesideExecutable();
-            if (driverPath.empty()) {
+            bool serviceIsOwned = false;
+            std::wstring serviceQueryError;
+            if (!IsOwnCombinedDriverServiceRunning(serviceIsOwned, serviceQueryError)) {
+                // If ownership cannot be established, treat the loaded image as
+                // externally managed. The application must never unload it.
+                serviceIsOwned = false;
+            }
+            ownsDriverLifecycle = serviceIsOwned;
+            std::wstring reuseStatus = serviceIsOwned ? L"正在复用本程序管理的统一驱动…"
+                                                       : L"正在复用已加载的驱动…";
+            if (!serviceQueryError.empty())
+                reuseStatus += L"服务归属检查失败，按外部驱动处理：" + serviceQueryError;
+            PostStatus(window, reuseStatus);
+            if (StartMinifilterSession(args->directory, args->stopEvent, minifilter,
+                                       filterError, false, serviceIsOwned)) {
+                PostFilterStatus(window, true,
+                    L"自删除捕获可用：命中的内核映像文件会在破坏性操作前保存快照。");
+            } else if (serviceIsOwned) {
                 failed = true;
-                error = L"无法确定 dt.exe 所在目录，未能查找 kdt.sys。";
+                error = filterError;
+            } else if (WaitForSingleObject(args->stopEvent, 0) != WAIT_OBJECT_0) {
+                PostFilterStatus(window, false,
+                    L"自删除捕获不可用：" + filterError + L"；映像加载监控仍可运行。");
+            } else {
+                stopRequested = true;
             }
-
-            if (!failed) {
-                DWORD attributes = GetFileAttributesW(driverPath.c_str());
-                if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                    failed = true;
-                    error = L"请将 kdt.sys 放在 dt.exe 同一目录。\r\n预期路径：" + driverPath;
-                    if (attributes == INVALID_FILE_ATTRIBUTES)
-                        error += L"\r\n" + MakeSystemError(L"文件检查失败", GetLastError());
-                }
-            }
-
-            if (!failed && !stopRequested) {
-                PostStatus(window, L"正在清理上次运行遗留的 kdt 服务…");
-                if (!CleanupStaleDriverService(error))
-                    failed = true;
-            }
-
-            if (!failed && !stopRequested) {
-                PostStatus(window, L"正在启动驱动…");
-                if (!InstallAndStartDriver(driverPath, error)) {
-                    failed = true;
-                } else {
-                    ownsDriverLifecycle = g_hDriverService != nullptr;
-                }
-            }
-
-            if (!failed && !stopRequested) {
-                PostStatus(window, L"正在连接驱动设备…");
-                for (int attempt = 0; attempt < 20; ++attempt) {
-                    device = CreateFileW(L"\\\\.\\kdt", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                    if (device != INVALID_HANDLE_VALUE)
-                        break;
-                    if (WaitForSingleObject(args->stopEvent, 250) == WAIT_OBJECT_0) {
+        } else {
+            bool serviceIsOwned = false;
+            if (!IsOwnCombinedDriverServiceRunning(serviceIsOwned, error)) {
+                failed = true;
+            } else if (serviceIsOwned) {
+                failed = true;
+                error = L"统一驱动服务报告为正在运行，但 \"\\\\.\\kdt\" 控制设备不可用。请通过服务管理器检查驱动状态。";
+            } else {
+                PostStatus(window, L"正在启动统一驱动…");
+                if (!StartMinifilterSession(args->directory, args->stopEvent, minifilter,
+                                            filterError, true, true)) {
+                    if (WaitForSingleObject(args->stopEvent, 0) == WAIT_OBJECT_0) {
                         stopRequested = true;
-                        break;
+                    } else {
+                        failed = true;
+                        error = filterError;
                     }
-                }
-                if (!stopRequested && device == INVALID_HANDLE_VALUE) {
-                    failed = true;
-                    error = MakeSystemError(L"无法打开驱动设备", GetLastError());
+                } else {
+                    ownsDriverLifecycle = minifilter.unloadOnStop;
+                    PostFilterStatus(window, true,
+                        L"自删除捕获可用：命中的内核映像文件会在破坏性操作前保存快照。");
+                    PostStatus(window, L"正在连接统一驱动设备…");
+                    for (int attempt = 0; attempt < 20; ++attempt) {
+                        device = CreateFileW(L"\\\\.\\kdt", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (device != INVALID_HANDLE_VALUE)
+                            break;
+                        if (WaitForSingleObject(args->stopEvent, 250) == WAIT_OBJECT_0) {
+                            stopRequested = true;
+                            break;
+                        }
+                    }
+                    if (!stopRequested && device == INVALID_HANDLE_VALUE) {
+                        failed = true;
+                        error = MakeSystemError(L"无法打开统一驱动设备", GetLastError());
+                    }
                 }
             }
         }
@@ -1672,9 +1508,9 @@ static unsigned __stdcall MonitorWorker(void* parameter)
                 (ioError == ERROR_INVALID_FUNCTION || ioError == ERROR_NOT_SUPPORTED ||
                  ioError == ERROR_INVALID_PARAMETER)) {
                 if (ownsDriverLifecycle) {
-                    error = L"已加载的 kdt 驱动版本不支持设置转储目录。程序会尝试卸载由本程序管理的服务；完成后请再次点击“开始”以加载当前目录中的 kdt.sys。";
+                    error = L"已加载的驱动版本不支持设置转储目录。请停止该驱动后重新启动监控。";
                 } else {
-                    error = L"已加载的 kdt 驱动版本不支持设置转储目录。该驱动由其他服务管理，程序不会卸载它；请先通过其管理程序停止驱动，再重新启动监控。";
+                    error = L"已加载的驱动版本不支持设置转储目录。该驱动由其他服务管理，程序不会卸载它；请先通过其管理程序停止驱动，再重新启动监控。";
                 }
             } else {
                 error = MakeSystemError(L"向驱动设置转储目录失败", ioError);
@@ -1705,10 +1541,17 @@ static unsigned __stdcall MonitorWorker(void* parameter)
             std::wstring receiveError = filterReceive.hEvent == nullptr
                 ? MakeSystemError(L"创建 minifilter 接收事件失败", GetLastError())
                 : L"无法接收 minifilter 捕获结果。";
-            std::wstring cleanupError;
-            CloseMinifilterSession(minifilter, cleanupError);
-            if (!cleanupError.empty()) receiveError += L"\r\n" + cleanupError;
-            PostFilterStatus(window, false, L"自删除捕获不可用：" + receiveError + L"；kdt 映像监控仍可运行。");
+            if (minifilter.unloadOnStop) {
+                failed = true;
+                error = receiveError + L"统一驱动无法继续安全监控。";
+                PostFilterStatus(window, false, L"统一驱动初始化失败：" + receiveError);
+            } else {
+                std::wstring cleanupError;
+                CloseMinifilterSession(minifilter, cleanupError);
+                if (!cleanupError.empty()) receiveError += L"\r\n" + cleanupError;
+                PostFilterStatus(window, false,
+                    L"自删除捕获不可用：" + receiveError + L"；映像加载监控仍可运行。");
+            }
         } else {
             filterReceivePending = true;
         }
@@ -1726,6 +1569,7 @@ static unsigned __stdcall MonitorWorker(void* parameter)
     }
 
     if (monitoringStarted && !failed) {
+        bool running = true;
         auto disableMinifilter = [&](const std::wstring& reason) {
             if (filterReceivePending && minifilter.port != INVALID_HANDLE_VALUE) {
                 CancelIoEx(minifilter.port, &filterReceive);
@@ -1738,15 +1582,12 @@ static unsigned __stdcall MonitorWorker(void* parameter)
                 minifilter.port = INVALID_HANDLE_VALUE;
             }
             minifilter.available = false;
-            std::wstring unloadError;
-            CloseMinifilterSession(minifilter, unloadError);
-            std::wstring status = L"自删除捕获不可用：" + reason;
-            if (!unloadError.empty()) status += L"；" + unloadError;
-            status += L"；kdt 映像监控仍可运行。";
-            PostFilterStatus(window, false, std::move(status));
+            failed = true;
+            error = L"minifilter 通信异常，统一驱动监控已停止：" + reason;
+            PostFilterStatus(window, false, error);
+            running = false;
         };
 
-        bool running = true;
         while (running) {
             HANDLE waitHandles[] = { args->stopEvent, driverEvent, args->configEvent,
                                      minifilter.available ? filterReceive.hEvent : nullptr };
@@ -1795,7 +1636,7 @@ static unsigned __stdcall MonitorWorker(void* parameter)
 
                 std::wstring errorText;
                 if (!driverUpdated)
-                    errorText = MakeSystemError(L"更新 kdt 转储目录失败", ioError);
+                errorText = MakeSystemError(L"更新映像监控转储目录失败", ioError);
                 if (!filterUpdated) {
                     if (!errorText.empty()) errorText += L"\r\n";
                     errorText += filterError;
@@ -1806,7 +1647,7 @@ static unsigned __stdcall MonitorWorker(void* parameter)
                 DWORD rollbackError = ERROR_SUCCESS;
                 if (!SetDriverDirectory(device, activeDirectory, rollbackError)) {
                     rollbackSucceeded = false;
-                    rollbackErrors += MakeSystemError(L"回滚 kdt 转储目录失败", rollbackError);
+                    rollbackErrors += MakeSystemError(L"回滚映像监控转储目录失败", rollbackError);
                 }
                 bool filterRollbackFailed = false;
                 if (filterWasAvailable) {
@@ -1820,9 +1661,9 @@ static unsigned __stdcall MonitorWorker(void* parameter)
                 if (!rollbackErrors.empty())
                     errorText += L"\r\n" + rollbackErrors;
                 if (filterRollbackFailed) {
-                    disableMinifilter(L"目录更新失败后无法恢复旧配置，已尝试卸载过滤器。");
+                    disableMinifilter(L"目录更新失败后无法恢复旧配置。");
                     rollbackSucceeded = false;
-                    errorText += L"\r\n过滤器目录回滚失败；即使卸载请求已发送，也停止监控以避免配置状态不一致。";
+                    errorText += L"\r\n过滤器目录回滚失败；为避免两种捕获结果写入不同目录，已停止监控。";
                 }
 
                 PostApplyResult(window, requestId, false,
@@ -1870,14 +1711,6 @@ static unsigned __stdcall MonitorWorker(void* parameter)
     if (device != INVALID_HANDLE_VALUE)
         CloseHandle(device);
 
-    std::wstring cleanupError;
-    if (!StopDriverService(cleanupError)) {
-        failed = true;
-        if (!error.empty())
-            error += L"\r\n";
-        error += cleanupError;
-    }
-
     const bool minifilterWasManaged = minifilter.unloadOnStop;
     if (filterReceivePending && minifilter.port != INVALID_HANDLE_VALUE) {
         CancelIoEx(minifilter.port, &filterReceive);
@@ -1898,11 +1731,11 @@ static unsigned __stdcall MonitorWorker(void* parameter)
     }
 
     if (stopRequested && !failed) {
-        error = ownsDriverLifecycle ? L"监控已停止，驱动服务已卸载。"
+        error = ownsDriverLifecycle ? L"监控已停止，统一驱动已卸载。"
                                     : L"监控已停止；驱动由其他服务管理，程序未卸载它。";
         if (minifilterWasManaged) {
-            error += L"自删除捕获过滤器已排空并卸载。";
-            PostFilterStatus(window, false, L"自删除捕获已停止；minifilter 已卸载。");
+            error += L"自删除捕获任务已排空。";
+            PostFilterStatus(window, false, L"自删除捕获和映像加载监控均已停止。");
         }
     }
     else if (failed && error.empty())
@@ -2377,7 +2210,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
     case WM_CLOSE:
         if (g_app.workerActive) {
             const int answer = MessageBoxW(window,
-                L"驱动正在启动或监控中。关闭窗口将停止监控、排空并卸载本程序启动的 minifilter；只有由本程序管理的 kdt 服务会被卸载。是否继续？",
+                L"驱动正在启动或监控中。关闭窗口将停止监控并排空捕获任务；只有由本程序管理的统一驱动服务会被卸载。是否继续？",
                 L"确认退出", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
             if (answer != IDYES)
                 return 0;
@@ -2402,22 +2235,16 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPA
 
 static LONG WINAPI ExceptionFilter(EXCEPTION_POINTERS*)
 {
-    std::wstring ignored;
-    StopDriverService(ignored);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static void TerminateHandler()
 {
-    std::wstring ignored;
-    StopDriverService(ignored);
     abort();
 }
 
 static void PureCallHandler()
 {
-    std::wstring ignored;
-    StopDriverService(ignored);
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)

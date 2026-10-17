@@ -1,7 +1,7 @@
 #pragma once
 
 #define DT_FILTER_PROTOCOL_VERSION 1
-#define DT_FILTER_SERVICE_NAME L"dtself"
+#define DT_FILTER_SERVICE_NAME L"dtcapture"
 #define DT_FILTER_PORT_NAME L"\\SelfDeleteCapturePort"
 #define DT_FILTER_ALTITUDE L"385201"
 

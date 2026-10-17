@@ -157,16 +157,12 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\kdt\kdt.vcxproj">
-      <Project>{5511C348-FEE0-6041-1DEB-EC09C3E1D266}</Project>
-      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
-    </ProjectReference>
-    <ProjectReference Include="..\sdfilter\sdfilter.vcxproj">
+    <ProjectReference Include="..\driver\dtcapture.vcxproj">
       <Project>{4E4A7DF0-5C1B-4F31-9F93-1226389E335B}</Project>
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
     </ProjectReference>
   </ItemGroup>
-  <ItemGroup><ClInclude Include="..\sdfilter\filter_protocol.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\driver\filter_protocol.h" /></ItemGroup>
   <ItemGroup>
     <Manifest Include="dt.exe.manifest" />
   </ItemGroup>

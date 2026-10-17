@@ -11,19 +11,20 @@
     <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
     <Configuration>Debug</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
-    <RootNamespace>sdfilter</RootNamespace>
+    <RootNamespace>dtcapture</RootNamespace>
+    <TargetName>dtcapture</TargetName>
     <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion><UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset><ConfigurationType>Driver</ConfigurationType>
-    <DriverType>WDM</DriverType><DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverType>KMDF</DriverType><DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion><UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset><ConfigurationType>Driver</ConfigurationType>
-    <DriverType>WDM</DriverType><DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <DriverType>KMDF</DriverType><DriverTargetPlatform>Universal</DriverTargetPlatform>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
@@ -32,23 +33,26 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup />
-  <PropertyGroup><OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir></PropertyGroup>
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\dtcapture\</IntDir>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard><PreprocessorDefinitions>_WIN64;_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/kernel %(AdditionalOptions)</AdditionalOptions></ClCompile>
-    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>Cng.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>Cng.lib;FltMgr.lib;Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
     <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile><WarningLevel>Level3</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard><PreprocessorDefinitions>NDEBUG;_WIN64;_AMD64_;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/kernel %(AdditionalOptions)</AdditionalOptions></ClCompile>
-    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>Cng.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions><AdditionalDependencies>Cng.lib;FltMgr.lib;Wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
     <DriverSign><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="sdfilter.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="filter_protocol.h" /></ItemGroup>
+  <ItemGroup><ClCompile Include="minifilter.cpp" /><ClCompile Include="kdt_component.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="filter_protocol.h" /><ClInclude Include="kdt_component.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>

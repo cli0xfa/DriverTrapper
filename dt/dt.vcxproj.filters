@@ -20,7 +20,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\sdfilter\filter_protocol.h">
+    <ClInclude Include="..\driver\filter_protocol.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

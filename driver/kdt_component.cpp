@@ -1,11 +1,13 @@
 #include <ntifs.h>
+#include <wdmsec.h>
+#include "kdt_component.h"
 
 #define DN L"\\Device\\kdt"
 #define SN L"\\DosDevices\\kdt"
 
-#define IOCTL_REGISTER_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_REGISTER_EVENT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_GET_LOAD_DATA  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+#define IOCTL_SET_DUMP_DIRECTORY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 #define DRIVER_TAG 'mndr'
 #define DUMP_DIRECTORY_CHARS 512
@@ -37,6 +39,11 @@ WCHAR g_DumpDirectory[DUMP_DIRECTORY_CHARS];
 USHORT g_DumpDirectoryLength = 0;
 EX_RUNDOWN_REF g_CopyWorkItemsRundown;
 volatile LONG g_Unloading = 0;
+volatile LONG g_ImageCallbackRegistered = 0;
+
+// Stable class identifier used by IoCreateDeviceSecure for this control device.
+const GUID g_DriverTrapperDeviceClass =
+{ 0xd8b8c8e2, 0x5f1d, 0x4e75, { 0x8e, 0xc9, 0xa9, 0x42, 0x2a, 0xc4, 0x5f, 0x0d } };
 
 VOID ReleaseCopyWorkItem(PWORK_ITEM_CONTEXT context) {
     if (context->WorkItem != NULL) {
@@ -272,9 +279,11 @@ void imcb(PUNICODE_STRING path, HANDLE pid, PIMAGE_INFO im) {
     }
 }
 
-void unl(PDRIVER_OBJECT d) {
+VOID KdtCleanup(PDRIVER_OBJECT d) {
     InterlockedExchange(&g_Unloading, 1);
-    PsRemoveLoadImageNotifyRoutine(imcb);
+    if (InterlockedExchange(&g_ImageCallbackRegistered, 0) != 0) {
+        PsRemoveLoadImageNotifyRoutine(imcb);
+    }
 
     // Image-notify callbacks can queue file-copy work that outlives the
     // callback itself. Keep the driver image and device object alive until
@@ -294,11 +303,12 @@ void unl(PDRIVER_OBJECT d) {
 
     ClearQueue();
 
-    if (d && d->DeviceObject) {
+    UNREFERENCED_PARAMETER(d);
+    if (g_DeviceObject != NULL) {
         UNICODE_STRING symbolicLinkName{};
         RtlInitUnicodeString(&symbolicLinkName, SN);
         IoDeleteSymbolicLink(&symbolicLinkName);
-        IoDeleteDevice(d->DeviceObject);
+        IoDeleteDevice(g_DeviceObject);
         g_DeviceObject = NULL;
     }
 }
@@ -480,9 +490,11 @@ NTSTATUS DispatchClose(PDEVICE_OBJECT d, PIRP i) {
 }
 
 extern "C"
-NTSTATUS DriverEntry(PDRIVER_OBJECT drvobj, PUNICODE_STRING path)
+NTSTATUS KdtInitialize(PDRIVER_OBJECT drvobj)
 {
-    UNREFERENCED_PARAMETER(path);
+    if (drvobj == NULL)
+        return STATUS_INVALID_PARAMETER;
+
     NTSTATUS status;
 
     InitializeListHead(&g_QueueHead);
@@ -490,17 +502,19 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drvobj, PUNICODE_STRING path)
     KeInitializeSpinLock(&g_DumpDirectoryLock);
     ExInitializeRundownProtection(&g_CopyWorkItemsRundown);
     g_Unloading = 0;
+    g_ImageCallbackRegistered = 0;
     RtlZeroMemory(g_DumpDirectory, sizeof(g_DumpDirectory));
     RtlCopyMemory(g_DumpDirectory, L"C:\\DriverDump\\", sizeof(L"C:\\DriverDump\\"));
     g_DumpDirectoryLength = (USHORT)(sizeof(L"C:\\DriverDump\\") - sizeof(WCHAR));
 
-    drvobj->DriverUnload = unl;
     drvobj->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;
     drvobj->MajorFunction[IRP_MJ_CLOSE] = DispatchClose;
     drvobj->MajorFunction[IRP_MJ_DEVICE_CONTROL] = ioc;
 
     UNICODE_STRING devName = RTL_CONSTANT_STRING(DN);
-    status = IoCreateDevice(drvobj, 0, &devName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
+    status = IoCreateDeviceSecure(drvobj, 0, &devName, FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN, FALSE, &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
+        &g_DriverTrapperDeviceClass, &g_DeviceObject);
     if (!NT_SUCCESS(status)) return status;
 
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(SN);
@@ -518,6 +532,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drvobj, PUNICODE_STRING path)
         g_DeviceObject = NULL;
         return status;
     }
+    InterlockedExchange(&g_ImageCallbackRegistered, 1);
 
     return STATUS_SUCCESS;
 }

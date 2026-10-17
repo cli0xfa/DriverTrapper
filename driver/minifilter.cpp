@@ -3,6 +3,7 @@
 #include <ntstrsafe.h>
 
 #include "filter_protocol.h"
+#include "kdt_component.h"
 
 namespace {
 
@@ -956,6 +957,11 @@ NTSTATUS FLTAPI FilterUnloadCallback(FLT_FILTER_UNLOAD_FLAGS)
         gFilter = nullptr;
     }
 
+    // This image also owns the \Device\kdt control interface and its
+    // image-load callback. Tear those down only after Filter Manager has
+    // drained the minifilter callbacks and deferred I/O work.
+    KdtCleanup(nullptr);
+
     if (InterlockedCompareExchange(&gAttachedInstances, 0, 0) == 0) {
         ClearCandidates();
         if (gSha256Provider != nullptr) {
@@ -1063,16 +1069,23 @@ void InitializePathMappings()
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
     UNREFERENCED_PARAMETER(registryPath);
+
+    NTSTATUS status = KdtInitialize(driverObject);
+    if (!NT_SUCCESS(status))
+        return status;
+
     KeInitializeSpinLock(&gCandidateLock);
     KeInitializeSpinLock(&gDirectoryLock);
     InitializeListHead(&gCandidates);
     ExInitializePushLock(&gPortLock);
     InitializePathMappings();
 
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&gSha256Provider, BCRYPT_SHA256_ALGORITHM,
-                                                   nullptr, BCRYPT_PROV_DISPATCH);
-    if (!NT_SUCCESS(status))
+    status = BCryptOpenAlgorithmProvider(&gSha256Provider, BCRYPT_SHA256_ALGORITHM,
+                                         nullptr, BCRYPT_PROV_DISPATCH);
+    if (!NT_SUCCESS(status)) {
+        KdtCleanup(driverObject);
         return status;
+    }
 
     gFilterRegistration.Size = sizeof(gFilterRegistration);
     gFilterRegistration.Version = FLT_REGISTRATION_VERSION;
@@ -1085,6 +1098,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING reg
     if (!NT_SUCCESS(status)) {
         BCryptCloseAlgorithmProvider(gSha256Provider, 0);
         gSha256Provider = nullptr;
+        KdtCleanup(driverObject);
         return status;
     }
 
@@ -1120,6 +1134,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING reg
             BCryptCloseAlgorithmProvider(gSha256Provider, 0);
             gSha256Provider = nullptr;
         }
+        KdtCleanup(driverObject);
         return status;
     }
     return STATUS_SUCCESS;

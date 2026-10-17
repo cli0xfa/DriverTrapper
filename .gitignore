@@ -21,5 +21,10 @@
 *.sys
 *.cat
 *.cer
+*.pfx
+*.p12
+*.pvk
+*.pem
+*.key
 *.exe
 
