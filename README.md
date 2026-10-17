@@ -40,6 +40,8 @@ Windows 内核驱动加载取证工具。`dt.exe` 是管理员权限运行的 Wi
 
 统一驱动使用 `/INTEGRITYCHECK`，该选项要求映像加载时验证数字签名；它不负责签名，目标系统仍须接受驱动签名。实际加载还受目标系统的签名策略约束，不能仅凭成功构建判断可运行。
 
+GitHub Actions 会在针对 `master` 的 Pull Request、推送到 `master` 以及推送 `v*` 标签时构建 x64 Release。推送版本标签（例如 `v0.1.0`）会自动创建 GitHub Release，附带 `DriverTrapper-win-x64.zip` 和 SHA-256 校验文件。发布包包含 `dt.exe`、`dtcapture.sys`、本 README 和许可证；CI 将驱动设为不签名构建，因此它不会绕过目标系统的驱动签名策略。需要在允许相应签名的测试环境中加载，或自行签名。
+
 ## 许可证
 
 源码以 MIT License 发布，详见 [`LICENSE`](LICENSE)。仓库不包含 Windows SDK/WDK 文件、已签名驱动或签名证书。开源许可与驱动签名是两回事：许可允许查看、修改和再发布源码；在目标 Windows 系统加载驱动仍受该系统的签名策略约束。

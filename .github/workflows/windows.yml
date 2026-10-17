@@ -1,0 +1,94 @@
+name: Windows CI and release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x64 Release
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
+          $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsPath = & $vswhere -latest -products '*' -version '[18.0,19.0)' -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vsPath) {
+            throw 'Visual Studio 2026 with MSBuild was not found.'
+          }
+
+          $msbuild = Join-Path $vsPath 'MSBuild\Current\Bin\MSBuild.exe'
+          $solution = Join-Path $env:GITHUB_WORKSPACE 'driver-trapper.slnx'
+          & $msbuild $solution /m /v:minimal /p:Configuration=Release /p:Platform=x64 /p:ApiValidator_Enable=false /p:SignMode=Off
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Package release files
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:RUNNER_TEMP 'DriverTrapper-package'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'x64\Release\dt.exe') $packageRoot
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'x64\Release\dtcapture.sys') $packageRoot
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'README.md') $packageRoot
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE 'LICENSE') $packageRoot
+
+          $archive = Join-Path $dist 'DriverTrapper-win-x64.zip'
+          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  DriverTrapper-win-x64.zip" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+      - name: Save CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: DriverTrapper-win-x64
+          path: |
+            dist/DriverTrapper-win-x64.zip
+            dist/DriverTrapper-win-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: DriverTrapper-win-x64
+          path: release-assets
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            'release-assets/DriverTrapper-win-x64.zip' `
+            'release-assets/DriverTrapper-win-x64.zip.sha256' `
+            --verify-tag `
+            --title $env:GITHUB_REF_NAME `
+            --generate-notes
